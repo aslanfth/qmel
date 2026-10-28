@@ -1,156 +1,275 @@
+#!/usr/bin/env python3
+"""Reproducible K-user QMeL regression scalability experiment.
+
+Uses bounded O(1/t) perturbations, the exact scalar meta-gradient,
+closed-form FTL dual weights, and a numerical hindsight comparator
+for each horizon prefix. Comparator evaluation is excluded from the
+recorded learning-update runtime. See README.md for usage and outputs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import platform
+import sys
+from pathlib import Path
+from time import perf_counter_ns
+
 import numpy as np
-import cvxpy as cp
-import matplotlib.pyplot as plt
 import pandas as pd
+from scipy.optimize import minimize_scalar
 
-# We will have a 1-dimensional linear regression, where we have multiple y values at each time-slot. Then, we will find x* and compare.
+from common import (
+    aggregate_trajectories, alpha_fairness, assert_finite,
+    first_crossing, parse_csv_list, prepare_output,
+    sustained_crossing, write_json,
+)
 
-def loss_fn(theta, a, y):
-    # y is a vector of size (num_tasks,)
-    error = a*theta - y
-    loss = error**2/2
-    return loss
 
-# Alpha-Fairness Function
-def alpha_fairness(x, alpha):
-    if alpha == 1:
-        return np.log(x)  # Special case for alpha=1 (logarithmic fairness)
-    return (x**(1 - alpha) - 1) / (1 - alpha)
+def generate_data(T: int, K: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """Clipped, bounded perturbations matching original Gaussian variance."""
+    rng = np.random.default_rng(seed)
+    radius = 0.1 * np.sqrt(3.0)
+    time = np.arange(1, T + 1, dtype=np.float64)
+    a = np.clip(1.0 + rng.uniform(-radius, radius, T) / time, 0.8, 1.0)
+    base = np.linspace(0.0, 1.0, K, dtype=np.float64)
+    y = np.clip(base + rng.uniform(-radius, radius, (T, K)) / time[:, None], 0.0, 1.0)
+    return a, y
 
-# Alpha-Fairness Function
-def alpha_fairness_cp(x, alpha):
-    if alpha == 1:
-        return cp.log(x)  # Special case for alpha=1 (logarithmic fairness)
-    return (x**(1 - alpha) - 1) / (1 - alpha)
 
-alpha = 4.0
-T = 100**2
-p = 0.5 # adding priorities makes it worse somehow, can be seen in desmos!
-# as p goes further away from 0.5, short-term, long-term and CWS benchmarks get closer to each other.
-p_low = min(p, 1-p)
-p_high = max(p, 1-p)
-# Following x_star provides us a pseudo regret, calculating x_star for each time-slot would require much more time.
-x_star = 0.361521 # a1: 0.29284, a2: 0.32269, a3: 0.34465, a4: 0.361521, a5: 0.37491 # for different alphas
-num_tasks = 2
-u_min = 0.01 # hyperparameter, set a low value for weights. this prevents vanishing weights!
-min_coeff = 1 # minimum of a's, here we set all a=1.
-xs = np.random.rand() * np.ones(5) # initialize x_1
-loss_max = 0.19140625 # Maximum loss value calculated theoretically. (using desmos)
-u_max = loss_max
-w_min = u_max**-alpha # initialize the dual space.
-w_max = u_min**-alpha if u_min > 0 else None
-print(w_min, w_max)
-w = w_min + (w_max - w_min)*np.random.rand() # initialize w_1 for our long-term solution.
-ws = np.vstack([w*np.ones(num_tasks), np.array([0.25, 0.75]), np.array([0.5, 0.5]), np.array([0.75, 0.25]), w*np.ones(num_tasks)]) #ours, 3 CWSs, short-term
-G_lips = p_high
-beta_smooth = p_high
-rho = 0 # 3rd derivative is 0!
-mu_strong = min_coeff**2*p_low
+def exact_prefix_comparator(a: np.ndarray, y: np.ndarray, alpha: float,
+                            eta: float) -> tuple[np.ndarray, np.ndarray]:
+    """Solve 1D hindsight optimization for every prefix of the *realized* tasks."""
+    T, K = y.shape
+    ybar = np.mean(y, axis=1)
+    A = a * (1.0 - eta * a*a)
+    B = eta * a[:, None]**2 * ybar[:, None] - y
+    s2 = np.cumsum(0.5 * A*A)
+    s1 = np.cumsum(A[:, None] * B, axis=0)
+    s0 = np.cumsum(0.5 * B*B, axis=0)
+    xstar = np.empty(T)
+    FStar = np.empty(T)
 
-# lr_update = min(0.5/beta_smooth, mu_strong/(8*rho*G_lips))
-lr_update = 0.5#/beta_smooth # rho = 0! #here, lr_update still respects the constraint since beta_smooth <= 1
-lr_dual = alpha/(u_min**(alpha+1))
-lr_primals = [8*(u_max**alpha)/(mu_strong*num_tasks), 8/(mu_strong*num_tasks*0.25), 8/(mu_strong*num_tasks*0.5), 8/(mu_strong*num_tasks*0.25), 8*(u_max**alpha)/(mu_strong*num_tasks), 0]
+    for t in range(T):
+        n = t + 1
 
-# Restricted adversary:
-# Labels are only changed sqrt(T) times, thus, regret is of O(sqrt(T)).
-# Essentially, priorities are not used since both are equal to 0.5.
-coeffs = np.ones([num_tasks, T])
-labels = np.zeros([num_tasks, T])
-priorities =  np.empty([num_tasks, T])
-priorities[0, :] = p
-priorities[1, :] = 1-p
-prio = np.ones([num_tasks, int(np.sqrt(T))])
-prio[0, :] = 1-p
-prio[1, :] = p
-for t in range(int(np.ceil(np.sqrt(T)))):
-    if t % 2 == 1:
-        labels[0, t*int(np.sqrt(T)):(t+1)*int(np.sqrt(T))] = 1
-        priorities[:, t*int(np.sqrt(T)):(t+1)*int(np.sqrt(T))] = prio
-losses = [[], [], [], [], [], []]
-utilities = [[], [], [], [], [], []]
-weights_left = []
-weights_right = []
-sum_utils = 0
-for t in range(T):
-    # if (t+1)%100 == 0:
-    #     print(f"Iter: {t+1}")
-    a = coeffs[:, t]
-    y = labels[:, t]
-    priority = priorities[:, t]
-    for i in range(6):
-        lr_primal = lr_primals[i]
-        if i < 5:
-            x = xs[i]
-            w = ws[i]
-        if i == 5:
-            x = x_star
-            w = np.zeros(num_tasks)
-        if i == 0:
-            weights_left.append(w[0])
-            weights_right.append(w[1])
-        grad_update = (a**2*x - a*y)*priority
-        grad_update = np.sum(grad_update)/num_tasks # equal weights in update.
-        theta = x - lr_update*grad_update # update function h().
-        loss = loss_fn(theta, a, y)*priority
-        losses[i].append(loss)
-        utility = loss_max - loss
-        utilities[i].append(utility)
-        if i == 0:
-            sum_utils += utility
-            # w -= lr_dual/(t+1)*(-w**(-1/alpha)+utility)
-            # w = np.clip(w, w_min, w_max)
-            w = np.clip((sum_utils/(t+1)), u_min, None)**(-alpha) # FTL
-        elif i == 4:
-            w = utility**(-alpha)
-            w = np.clip(w, w_min, w_max)
-        grad_meta = (a**2*theta-a*y)*priority
-        x -= w@(grad_meta*(1-lr_update*a**2@priority/num_tasks))*lr_primal/(t+1)
-        x = min(max(x, 0), 1)
-        if i == 5:
-            x = x_star
-        elif i < 5:
-            xs[i] = x
-            ws[i] = w
+        def negative_equity(x: float) -> float:
+            util = 1.0 - (s2[t]*x*x + s1[t]*x + s0[t]) / n
+            return -float(np.sum(alpha_fairness(util, alpha)))
 
-fairnesses = []
-regrets = []
-fig, axes = plt.subplots(2, 3, figsize=(12, 4))
-axes[0, 0].set_title('Loss1')
-axes[0, 1].set_title('Loss2')
-axes[0, 2].set_title('Fairness')
-axes[1, 0].set_title('Util1')
-axes[1, 1].set_title('Util2')
-axes[1, 2].set_title('Regret')
-res_csv = pd.DataFrame()
-utils_benchmark = utilities[-1]
-for i in range(5):
-    utils = utilities[i]
-    cum_utils = np.cumsum(utils, 0)/np.arange(1,T+1).reshape(-1, 1)
-    fairness = np.sum(alpha_fairness(cum_utils, alpha), -1)
-    fairness_benchmark = np.sum(alpha_fairness(np.cumsum(utils_benchmark, 0)/np.arange(1,T+1).reshape(-1, 1), alpha), -1)
-    fairnesses.append(fairness)
-    regret = fairness_benchmark - fairness
-    regrets.append(regret)
-    res_csv[f'fairness_{i}'] = fairness
-    res_csv[f'regret_{i}'] = regret
-    res_csv[f'util_{i}_left'] = cum_utils[:, 0]
-    res_csv[f'util_{i}_right'] = cum_utils[:, 1]
-    cumsum_loss = np.cumsum(np.stack(losses[i]), 0)/np.arange(1,T+1).reshape(-1, 1)
-    res_csv[f'loss_{i}_left'] = cumsum_loss[:, 0]
-    res_csv[f'loss_{i}_right'] = cumsum_loss[:, 1]
-    axes[0, 0].plot(cumsum_loss[:, 0], label = i)
-    axes[0, 1].plot(cumsum_loss[:, 1], label = i)
-    axes[0, 2].plot(fairness, label = i)
-    axes[1, 0].plot(cum_utils[:, 0], label = i)
-    axes[1, 1].plot(cum_utils[:, 1], label = i)
-    axes[1, 2].plot(regret, label=i)
+        opt = minimize_scalar(negative_equity, bounds=(0., 1.), method='bounded',
+                              options={'xatol': 1e-11, 'maxiter': 500})
+        if not opt.success:
+            raise RuntimeError(f'Comparator failed for prefix {n}: {opt.message}')
+        choices = [(0.0, negative_equity(0.0)),
+                   (1.0, negative_equity(1.0)),
+                   (float(opt.x), negative_equity(float(opt.x)))]
+        bestx, neg_val = min(choices, key=lambda pair: pair[1])
+        xstar[t] = bestx
+        FStar[t] = -neg_val
 
-res_csv['weights_left'] = weights_left
-res_csv['weights_right'] = weights_right
-res_csv[::100].to_csv(f'paper_results/aistats/toy_compare_a{alpha}.csv', index_label='iteration')
-# print(xs)
-# print(fairness_benchmark[-1])
-# axes[0, 2].legend()
-# axes[1, 2].legend()
-# plt.show()
+    return xstar, FStar
+
+
+def analytic_meta_gradient(x: float, a: float, y: np.ndarray,
+                           w: np.ndarray, eta: float) -> float:
+    theta = x - eta * np.mean(a * (a*x - y))
+    return float((1.0 - eta*a*a) * np.dot(w, -a*(a*theta-y)))
+
+
+def verify_derivative() -> float:
+    x, a, eta = 0.37, 0.91, 0.5
+    y = np.array([0.13, 0.42, 0.72, 0.96])
+    w = np.array([1.4, 2.1, 1.2, 1.6])
+
+    def objective(z: float) -> float:
+        theta = z - eta*np.mean(a*(a*z-y))
+        u = 1.0 - 0.5*(a*theta-y)**2
+        return float(w @ u)
+
+    eps = 1e-6
+    finite_diff = (objective(x+eps)-objective(x-eps))/(2*eps)
+    analytic = analytic_meta_gradient(x, a, y, w, eta)
+    error = abs(analytic-finite_diff) / max(1., abs(finite_diff))
+    if error > 1e-7:
+        raise AssertionError(f'K-user finite-difference gradient error {error}')
+    return error
+
+
+def run_one(T: int, K: int, alpha: float, seed: int,
+            output: Path, verify: bool, save_user_histories: bool) -> tuple[pd.DataFrame, dict]:
+    a, y = generate_data(T, K, seed)
+    if verify:
+        a2, y2 = generate_data(T, K, seed)
+        assert np.array_equal(a, a2) and np.array_equal(y, y2)
+    assert np.all((a >= 0.8) & (a <= 1.0))
+    assert np.all((y >= 0.) & (y <= 1.))
+    eta, umin, umax = 0.5, 0.5, 1.0
+    mu = 0.8**2
+    outer_lr = 8 * (umax**alpha) / (mu*K)
+
+    # Identical seed-based initialization across alpha configurations.
+    x = float(np.random.default_rng(seed + 1_000_000).uniform(0., 1.))
+    w = np.ones(K)
+    cum_util = np.zeros(K)
+    utilities = np.empty((T, K))
+    weights = np.empty((T, K))
+    initialization = np.empty(T)
+    adapted = np.empty(T)
+    xafter = np.empty(T)
+    timing_us = np.empty(T)
+
+    for t in range(T):
+        tic = perf_counter_ns()
+        at, yt = a[t], y[t]
+        initialization[t] = x
+        weights[t] = w
+        theta = x - eta*np.mean(at*(at*x-yt))
+        adapted[t] = theta
+        u = 1.0 - 0.5*(at*theta-yt)**2
+        if np.any(u < umin-1e-10) or np.any(u > umax+1e-10):
+            raise AssertionError(f'K-user utility outside analytic range at t={t+1}')
+        utilities[t] = u
+
+        grad = (1.0-eta*at*at) * np.dot(w, -at*(at*theta-yt))
+        x = float(np.clip(x + outer_lr*grad/(t+1), 0., 1.))
+        xafter[t] = x
+        cum_util += u
+        w = np.clip(cum_util/(t+1), umin, umax)**(-alpha)
+        timing_us[t] = (perf_counter_ns() - tic) / 1000.
+
+    assert_finite('utility history', utilities)
+    assert_finite('weight history', weights)
+    cum_avg = np.cumsum(utilities, axis=0)/np.arange(1, T+1)[:, None]
+    equity = np.sum(alpha_fairness(cum_avg, alpha), axis=1)
+    xstar, equity_star = exact_prefix_comparator(a, y, alpha, eta)
+    regret = equity_star - equity
+    # A relative gap is undefined if the comparator's equity equals zero.
+    gap = np.divide(100.*np.abs(regret), np.abs(equity_star),
+                    out=np.full(T, np.nan), where=np.abs(equity_star)>1e-12)
+    if not np.any(np.isfinite(gap)):
+        raise AssertionError('No defined relative gaps')
+
+    if verify:
+        # A dense grid must not beat our numerical scalar optimizer.
+        grid = np.linspace(0., 1., 1001)
+        for t in (0, T//2, T-1):
+            ybar = y[:t+1].mean(axis=1)
+            theta_grid = (1-eta*a[:t+1, None]**2)*grid[None, :] + eta*a[:t+1, None]*ybar[:, None]
+            residual = a[:t+1, None, None]*theta_grid[:, :, None]-y[:t+1, None, :]
+            avg_u = (1-.5*residual**2).mean(axis=0)
+            max_grid = np.max(np.sum(alpha_fairness(avg_u, alpha), axis=1))
+            if equity_star[t] < max_grid-1e-8:
+                raise AssertionError('Numerical hindsight optimum below brute-force grid')
+        if not np.all((weights >= 1-1e-9) & (weights <= (2.**alpha)+1e-9)):
+            raise AssertionError('K-user weights outside dual domain')
+
+    df = pd.DataFrame({
+        'round': np.arange(1, T+1), 'equity': equity,
+        'equity_star': equity_star, 'regret': regret, 'gap_percent': gap,
+        'x_star': xstar, 'x_pre': initialization, 'theta': adapted,
+        'x_post': xafter, 'runtime_us': timing_us,
+        'weight_min': weights.min(axis=1), 'weight_max': weights.max(axis=1),
+        'utility_min': utilities.min(axis=1), 'utility_max': utilities.max(axis=1),
+    })
+    tag = f'k{K}_alpha{alpha:g}_seed{seed}'
+    df.to_csv(output/'trajectories'/f'{tag}.csv', index=False)
+    if save_user_histories:
+        np.savez_compressed(output/'user_histories'/f'{tag}.npz',
+                            utility=utilities, weight=weights, a=a, y=y,
+                            initialization=initialization, adapted=adapted)
+
+    metrics = {
+        'alpha': alpha, 'K': K, 'seed': seed, 'T': T,
+        'final_equity': float(equity[-1]), 'final_equity_star': float(equity_star[-1]),
+        'final_regret': float(regret[-1]), 'final_gap_percent': float(gap[-1]),
+        't10_first': first_crossing(gap, 10.),
+        't5_first': first_crossing(gap, 5.),
+        't10_sustained': sustained_crossing(gap, 10.),
+        't5_sustained': sustained_crossing(gap, 5.),
+        'mean_runtime_us': float(timing_us.mean()),
+        'median_runtime_us': float(np.median(timing_us)),
+        'min_utility': float(utilities.min()), 'max_utility': float(utilities.max()),
+        'min_weight': float(weights.min()), 'max_weight': float(weights.max()),
+        'final_x_star': float(xstar[-1]),
+    }
+    return df, metrics
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--verify', action='store_true', help='Run fast numerical checks and a small multi-seed grid')
+    parser.add_argument('--T', type=int, default=50_000, help='Number of online rounds')
+    parser.add_argument('--seeds', default='0,1,2,3,4,5,6,7,8,9')
+    parser.add_argument('--alphas', default='1,2')
+    parser.add_argument('--users', default='4,16,64,256', help='Comma-separated K values')
+    parser.add_argument('--save-user-histories', action='store_true',
+                        help='Store all K per-user utilities/weights as .npz (large for T=50k)')
+    parser.add_argument('--output', type=Path, default=None, help='Output directory')
+    parser.add_argument('--overwrite', action='store_true', help='Replace an existing output generated by this script')
+    args = parser.parse_args()
+    T = 24 if args.verify else args.T
+    seeds = [0, 1] if args.verify else parse_csv_list(args.seeds, int)
+    alphas = [1., 2.] if args.verify else parse_csv_list(args.alphas, float)
+    users = [4, 16] if args.verify else parse_csv_list(args.users, int)
+    if T < 2 or any(a <= 0 for a in alphas) or any(k < 2 for k in users) or any(s < 0 for s in seeds):
+        parser.error('Require T>=2, alpha>0, K>=2, and nonnegative seeds')
+    output = args.output or Path('results/k_scalability')/('verify' if args.verify else 'full')
+    out = prepare_output(output, args.overwrite)
+    gradient_error = verify_derivative()
+    write_json(out/'config.json', {
+        'experiment': 'k_scalability', 'verify': args.verify, 'T': T,
+        'seeds': seeds, 'alphas': alphas, 'users': users,
+        'eta': 0.5, 'u_min': 0.5, 'u_max': 1., 'mu_lower': 0.8**2,
+        'noise': 'uniform radius sqrt(3)*0.1, clipped, 1/t',
+        'dual_update': 'closed-form FTL; next-round weight',
+        'hindsight': 'exact realized-sequence prefix scalar optimization',
+        'save_user_histories': bool(args.save_user_histories or args.verify),
+        'python': sys.version, 'numpy': np.__version__, 'pandas': pd.__version__,
+        'platform': platform.platform(), 'finite_difference_relative_error': gradient_error,
+    })
+    rows = []
+    long_groups = []
+    for alpha in alphas:
+        for K in users:
+            frames = []
+            for seed in seeds:
+                print(f'RUN K={K}, alpha={alpha:g}, seed={seed}, T={T}', flush=True)
+                frame, metrics = run_one(T, K, alpha, seed, out, args.verify,
+                                         args.save_user_histories or args.verify)
+                frames.append(frame)
+                rows.append(metrics)
+                print(f'K={K:3d} alpha={alpha:g} seed={seed} '
+                      f'final regret={metrics["final_regret"]:.6g} '
+                      f'10%={metrics["t10_first"]} 5%={metrics["t5_first"]} '
+                      f'runtime={metrics["mean_runtime_us"]:.1f} us')
+            agg = aggregate_trajectories(frames)
+            agg.insert(0, 'alpha', alpha)
+            agg.insert(1, 'K', K)
+            agg.to_csv(out/'aggregated'/f'k{K}_alpha{alpha:g}.csv', index=False)
+            long_groups.append(agg)
+    summary = pd.DataFrame(rows)
+    summary.to_csv(out/'summary_per_seed.csv', index=False)
+    grouped = summary.groupby(['alpha', 'K'], sort=True)
+    agg_summary = grouped.agg(['mean', 'std'])
+    agg_summary.columns = [f'{col}_{stat}' for col, stat in agg_summary.columns]
+    counts = grouped.size().rename('n_seeds')
+    agg_summary = agg_summary.join(counts).reset_index()
+    agg_summary.to_csv(out/'summary_aggregated.csv', index=False)
+    pd.concat(long_groups, ignore_index=True).to_csv(
+        out/'aggregated'/'k_all_trajectories.csv', index=False)
+    if args.verify:
+        write_json(out/'verify_report.json', {
+            'status': 'PASS', 'finite_difference_relative_error': gradient_error,
+            'n_runs': len(rows), 'checked': [
+                'deterministic data generation', 'scalar meta-gradient finite differences',
+                'utility/weight bounds', 'prefix comparator vs dense grid',
+                'saved full trajectories and aggregated CSVs'
+            ],
+        })
+        print('VERIFY PASS:', out/'verify_report.json')
+    print('Saved outputs under', out)
+
+
+if __name__ == '__main__':
+    main()
