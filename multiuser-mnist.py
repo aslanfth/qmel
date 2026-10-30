@@ -357,8 +357,7 @@ def train(model, meta_method, user_loaders, meta_optimizer, update_lr, meta_step
             for batch in zip(*batches):
                 t = t + 1
                 if t%2 == 0:
-                    environment = torch.Tensor([128, 64, 32, 16, 8, 4, 2, 1]).to(device) # we can even set them 0 for active/passive users
-                    # in the paper we can sell this as a selection mechanism etc.
+                    environment = torch.Tensor([128, 64, 32, 16, 8, 4, 2, 1]).to(device)
                 else:
                     environment = torch.Tensor([1, 64, 32, 16, 8, 4, 2, 128]).to(device)
                 environment = environment/sum(environment)

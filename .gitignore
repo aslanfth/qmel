@@ -185,6 +185,9 @@ experiments/celeba/save/
 experiments/celeba/trainlogs/
 wandb/
 runs/
+data/
+dataset/
+
 
 # Model checkpoints
 *.pt

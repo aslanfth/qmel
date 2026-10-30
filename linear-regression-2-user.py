@@ -26,8 +26,7 @@ def alpha_fairness_cp(x, alpha):
 
 alpha = 4.0
 T = 100**2
-p = 0.5 # adding priorities makes it worse somehow, can be seen in desmos!
-# as p goes further away from 0.5, short-term, long-term and CWS benchmarks get closer to each other.
+p = 0.5
 p_low = min(p, 1-p)
 p_high = max(p, 1-p)
 # Following x_star provides us a pseudo regret, calculating x_star for each time-slot would require much more time.
@@ -36,7 +35,7 @@ num_tasks = 2
 u_min = 0.01 # hyperparameter, set a low value for weights. this prevents vanishing weights!
 min_coeff = 1 # minimum of a's, here we set all a=1.
 xs = np.random.rand() * np.ones(5) # initialize x_1
-loss_max = 0.19140625 # Maximum loss value calculated theoretically. (using desmos)
+loss_max = 0.19140625 # Maximum loss value calculated theoretically.
 u_max = loss_max
 w_min = u_max**-alpha # initialize the dual space.
 w_max = u_min**-alpha if u_min > 0 else None

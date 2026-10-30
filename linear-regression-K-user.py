@@ -27,7 +27,7 @@ from common import (
 
 
 def generate_data(T: int, K: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
-    """Clipped, bounded perturbations matching original Gaussian variance."""
+    """Generate bounded uniform perturbations decaying as 1/t."""    
     rng = np.random.default_rng(seed)
     radius = 0.1 * np.sqrt(3.0)
     time = np.arange(1, T + 1, dtype=np.float64)
